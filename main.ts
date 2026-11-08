@@ -48,23 +48,26 @@ export interface Params {
   wideMul: number;
 }
 
+// Tuned on a backtest over every read from 2026-10-30 to 2026-11-08 (31 forecast origins, each scored on the reads
+// of its next 24 hours). Trend and time-of-day came out at zero there, so they are off; the hazard is kept small as
+// insurance against a long-running #1 falling off, which cost little on the backtest.
 export const DEFAULTS: Params = {
   trendHours: 36,
-  trendTau: 18,
-  levelBlend: 0.3,
-  drift: 0.6,
+  trendTau: 6,
+  levelBlend: 0,
+  drift: 0,
   driftFade: 24,
   slopeCap: 0.08,
-  tod: 1,
+  tod: 0,
   todShrink: 2,
   todWidth: 1.5,
-  s0: 0.25,
-  s1: 0.09,
-  haz0: 0.02,
-  hazAge: 0.08,
+  s0: 0.1,
+  s1: 0.06,
+  haz0: 0,
+  hazAge: 0.04,
   ageStart: 6,
-  newTilt: 4,
-  wideW: 0,
+  newTilt: 9,
+  wideW: 0.1,
   wideMul: 3,
 };
 
