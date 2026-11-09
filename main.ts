@@ -7,8 +7,10 @@
 //   hour    a per-game time-of-day offset learned from the last three days' residuals (Blox Fruits taking #1 in
 //           US night hours, for example), shrunk towards zero when there is little evidence;
 //   spread  a normal in log-rank whose width grows with the horizon;
-//   hazard  a chance of leaving the chart that grows once a game has been on it for about a week (DONT SPLASH fell
-//           from #1 off the chart within hours).
+//   hazard  an optional chance of leaving the chart that grows with time on it (tuned off: the shocks cover it);
+//   shocks  scenarios mixed in by the chance they have happened by each hour: a top-15 game drops off the chart and
+//           the games below move up (DONT SPLASH from #1, Blox Fruits from #2), a new game jumps into the top 10 and
+//           the games below move down, or a game that just left the top 10 comes back to its place.
 // Every slot's game-by-place matrix is balanced (Sinkhorn) so each place sums to 1 and each game to its survival,
 // with a "newcomer" row taking the mass of games we cannot name. Places 1-10 averaged over the slots are the output.
 //
@@ -46,11 +48,28 @@ export interface Params {
   /** Heavy tail: this share of each game's rank spread is wideMul times as wide, for sudden jumps and falls. */
   wideW: number;
   wideMul: number;
+  /** Shock scenarios, each mixed in with the probability that it has happened by the slot's hour:
+   *  dropout   a game in the top dropTop leaves the chart at dropRate per day, and every game below moves up one;
+   *  entry     a new game lands in the top 10 at entryRate per day, at a place drawn from ENTRY_PLACES, and every
+   *            game from that place down moves down one;
+   *  return    a game that left the top 10 in the last 72 hours comes back to its old place: returnP in all,
+   *            spread over time with returnTau hours, counted from when it was last seen. */
+  dropRate: number;
+  dropTop: number;
+  entryRate: number;
+  returnP: number;
+  returnTau: number;
+  /** Compute every slotStep-th slot (the slots between share its matrix) to keep runs fast. */
+  slotStep: number;
 }
 
-// Tuned on a backtest over every read from 2026-10-30 to 2026-11-08 (31 forecast origins, each scored on the reads
-// of its next 24 hours). Trend and time-of-day came out at zero there, so they are off; the hazard is kept small as
-// insurance against a long-running #1 falling off, which cost little on the backtest.
+/** Where games jumping into the top 10 have landed (#2-#7 in the history): weights for places 1..10. */
+const ENTRY_PLACES = [0.5, 1, 1, 1, 1, 1, 0.7, 0.5, 0.3, 0.2];
+
+// Tuned on a backtest over every read from 2026-10-30 to 2026-11-09 (36 forecast origins, each scored on the reads
+// of its next 24 hours). Trend and time-of-day came out at zero there, so they are off. Dropouts are handled by the
+// shock scenarios instead of the age hazard: dropRate 0.1 is the observed rate (10 top-10 games left the chart in
+// ~2,400 game-hours), entryRate 0.7 the observed jump-ins (7 in 10 days).
 export const DEFAULTS: Params = {
   trendHours: 36,
   trendTau: 6,
@@ -61,14 +80,20 @@ export const DEFAULTS: Params = {
   tod: 0,
   todShrink: 2,
   todWidth: 1.5,
-  s0: 0.1,
-  s1: 0.06,
+  s0: 0.06,
+  s1: 0.05,
   haz0: 0,
-  hazAge: 0.04,
+  hazAge: 0,
   ageStart: 6,
-  newTilt: 9,
-  wideW: 0.1,
+  newTilt: 6,
+  wideW: 0.15,
   wideMul: 3,
+  dropRate: 0.1,
+  dropTop: 15,
+  entryRate: 0.7,
+  returnP: 0.15,
+  returnTau: 12,
+  slotStep: 3,
 };
 
 export interface Read {
@@ -132,6 +157,10 @@ interface GameModel {
   /** Residual samples for the time-of-day offset: [UTC hour of day, residual]. */
   todSamples: Array<[number, number]>;
   ageDays: number;
+  /** Place on the last chart, or 0 when it is not on it. */
+  lastRank: number;
+  /** For a game off the last chart's top 10 that was in a top 10 in the last 72 hours: its last such place and when. */
+  wasTop?: { rank: number; t: number };
 }
 
 function hourOfDay(t: number): number {
@@ -150,6 +179,13 @@ function buildModels(reads: Read[], p: Params): { games: GameModel[]; size: numb
     if (r.t < tLast - 12 * HOUR) continue;
     for (const u of r.order.slice(0, 40)) if (!seen.has(u)) { seen.add(u); ids.push(u); }
   }
+  // Games that held a top-10 place in the last 72 hours but no longer do: candidates to come back.
+  const wasTop = new Map<number, { rank: number; t: number }>();
+  for (const r of reads) {
+    if (r.t < tLast - 72 * HOUR) continue;
+    r.order.slice(0, 10).forEach((u, i) => wasTop.set(u, { rank: i + 1, t: r.t }));
+  }
+  for (const u of wasTop.keys()) if (!seen.has(u)) { seen.add(u); ids.push(u); }
   const firstSeen = new Map<number, number>();
   for (const r of reads) for (const u of r.order) if (!firstSeen.has(u)) firstSeen.set(u, r.t);
 
@@ -175,7 +211,10 @@ function buildModels(reads: Read[], p: Params): { games: GameModel[]; size: numb
       present.forEach((r, i) => todSamples.push([hourOfDay(r.t), py[i]! - (a2 + b2 * px[i]!)]));
     }
     const ageDays = (tLast - (firstSeen.get(id) ?? tLast)) / (24 * HOUR);
-    games.push({ id, level, slope, todSamples, ageDays });
+    const lastRank = last.rank.get(id) ?? 0;
+    const top = wasTop.get(id);
+    const comeback = top && (lastRank === 0 || lastRank > 10) && top.t < tLast ? top : undefined;
+    games.push({ id, level, slope, todSamples, ageDays, lastRank, ...(comeback ? { wasTop: comeback } : {}) });
   }
   return { games, size, tLast };
 }
@@ -192,34 +231,71 @@ function todOffset(g: GameModel, hour: number, p: Params): number {
   return (p.tod * sr) / (sw + p.todShrink);
 }
 
-/** One slot's game-by-place probabilities (rows: games then the newcomer row; columns: places 1..size). */
-function slotMatrix(games: GameModel[], size: number, hoursAhead: number, hour: number, p: Params): Float64Array[] {
+/** A shock scenario: none, game `index` drops out, an unnamed game enters at `place`, or game `index` returns there. */
+interface Shock {
+  kind: 'none' | 'drop' | 'entry' | 'return';
+  index: number;
+  place: number;
+}
+
+/** A normal in log-rank around mu (plus its heavy tail) over places 1..size; returns the profile and its mass. */
+function rankProfile(mu: number, sigma: number, edges: Float64Array, size: number, p: Params): [Float64Array, number] {
+  const wide = sigma * p.wideMul;
+  const row = new Float64Array(size);
+  let prev = 0;
+  for (let k = 0; k < size; k++) {
+    const c = (1 - p.wideW) * phi((edges[k + 1]! - mu) / sigma) + p.wideW * phi((edges[k + 1]! - mu) / wide);
+    row[k] = Math.max(c - prev, 1e-300);
+    prev = c;
+  }
+  return [row, prev];
+}
+
+/** One slot's game-by-place probabilities under one shock (rows: the games, in order; columns: places 1..size). */
+function slotMatrix(games: GameModel[], size: number, hoursAhead: number, hour: number, p: Params, shock: Shock): Float64Array[] {
   const h = Math.max(0, hoursAhead);
   const sigma = Math.sqrt(p.s0 * p.s0 + p.s1 * p.s1 * h);
   const fade = p.driftFade > 0 ? p.driftFade * (1 - Math.exp(-h / p.driftFade)) : h;
   const edges = new Float64Array(size + 1);
   for (let k = 0; k <= size; k++) edges[k] = Math.log(k + 0.5);
+  const mus = games.map((g) => Math.max(0, g.level + p.drift * g.slope * fade + todOffset(g, hour, p)));
+  // Apply the shock as a shift of every game's expected place.
+  if (shock.kind === 'drop') {
+    const gone = Math.exp(mus[shock.index]!);
+    for (let i = 0; i < mus.length; i++) {
+      const r = Math.exp(mus[i]!);
+      if (i !== shock.index && r > gone) mus[i] = Math.log(Math.max(1, r - 1));
+    }
+  } else if (shock.kind === 'entry' || shock.kind === 'return') {
+    for (let i = 0; i < mus.length; i++) {
+      const r = Math.exp(mus[i]!);
+      if (i !== shock.index && r >= shock.place - 0.5) mus[i] = Math.log(r + 1);
+    }
+    if (shock.kind === 'return') mus[shock.index] = Math.log(shock.place);
+  }
   const rows: Float64Array[] = [];
   const target: number[] = [];
   let total = 0;
-  for (const g of games) {
-    const mu = Math.max(0, g.level + p.drift * g.slope * fade + todOffset(g, hour, p));
-    const row = new Float64Array(size);
-    const wide = sigma * p.wideMul;
-    let prev = 0;
-    let mass = 0;
-    for (let k = 0; k < size; k++) {
-      const c = (1 - p.wideW) * phi((edges[k + 1]! - mu) / sigma) + p.wideW * phi((edges[k + 1]! - mu) / wide);
-      row[k] = Math.max(c - prev, 1e-300);
-      mass += c - prev;
-      prev = c;
+  games.forEach((g, i) => {
+    if (shock.kind === 'drop' && i === shock.index) {
+      rows.push(new Float64Array(size));
+      target.push(0);
+      return;
     }
+    const [row, mass] = rankProfile(mus[i]!, sigma, edges, size, p);
     const hazard = p.haz0 + p.hazAge * Math.max(0, g.ageDays + h / 24 - p.ageStart);
-    const survive = Math.exp(-hazard * (h / 24));
+    const survive = shock.kind === 'return' && i === shock.index ? 1 : Math.exp(-hazard * (h / 24));
     const want = Math.min(1, mass) * survive;
     rows.push(row);
     target.push(want);
     total += want;
+  });
+  // An entering game is unnamed: its row takes its place's mass without being any game we name.
+  if (shock.kind === 'entry') {
+    const [row, mass] = rankProfile(Math.log(shock.place), sigma, edges, size, p);
+    rows.push(row);
+    target.push(Math.min(1, mass));
+    total += Math.min(1, mass);
   }
   // Newcomers and the games we cannot name fill whatever the named games leave, mostly near the bottom.
   const fresh = new Float64Array(size);
@@ -227,7 +303,7 @@ function slotMatrix(games: GameModel[], size: number, hoursAhead: number, hour: 
   rows.push(fresh);
   target.push(Math.max(1e-6, size - total));
   // Sinkhorn: rows to their targets, every place to 1.
-  for (let it = 0; it < 60; it++) {
+  for (let it = 0; it < 40; it++) {
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i]!;
       let s = 0;
@@ -249,10 +325,33 @@ export function forecast(reads: Read[], win: Window, places: number, p: Params =
   const { games, size, tLast } = buildModels(reads, p);
   const n = games.length;
   const avg: Float64Array[] = games.map(() => new Float64Array(places));
-  for (let s = 0; s < win.slots; s++) {
-    const t = win.from + s * win.slotMs + 60_000;
-    const m = slotMatrix(games, size, (t - tLast) / HOUR, hourOfDay(t), p);
-    for (let i = 0; i < n; i++) for (let k = 0; k < places; k++) avg[i]![k]! += m[i]![k]! / win.slots;
+  const entryTotal = ENTRY_PLACES.reduce((a, b) => a + b, 0);
+  const step = Math.max(1, Math.round(p.slotStep));
+  for (let s0 = 0; s0 < win.slots; s0 += step) {
+    // This computed slot stands for the slots s0..s0+step-1; it is evaluated at their middle.
+    const covers = Math.min(step, win.slots - s0);
+    const t = win.from + (s0 + (covers - 1) / 2) * win.slotMs + 60_000;
+    const h = Math.max(0, (t - tLast) / HOUR);
+    const shocks: Array<[number, Shock]> = [];
+    const qDrop = 1 - Math.exp((-p.dropRate * h) / 24);
+    if (qDrop > 0) games.forEach((g, i) => { if (g.lastRank >= 1 && g.lastRank <= p.dropTop) shocks.push([qDrop, { kind: 'drop', index: i, place: 0 }]); });
+    const qEntry = 1 - Math.exp((-p.entryRate * h) / 24);
+    if (qEntry > 0) ENTRY_PLACES.forEach((w, e) => { if (e < size) shocks.push([(qEntry * w) / entryTotal, { kind: 'entry', index: -1, place: e + 1 }]); });
+    games.forEach((g, i) => {
+      if (!g.wasTop || p.returnP <= 0) return;
+      const since = (tLast - g.wasTop.t) / HOUR;
+      const q = p.returnP * (Math.exp(-since / p.returnTau) - Math.exp(-(since + h) / p.returnTau));
+      if (q > 0) shocks.push([q, { kind: 'return', index: i, place: g.wasTop.rank }]);
+    });
+    let qAll = shocks.reduce((a, [q]) => a + q, 0);
+    const scale = qAll > 0.9 ? 0.9 / qAll : 1;
+    qAll *= scale;
+    const mixes: Array<[number, Shock]> = [[1 - qAll, { kind: 'none', index: -1, place: 0 }], ...shocks.map(([q, sh]): [number, Shock] => [q * scale, sh])];
+    for (const [w, shock] of mixes) {
+      const m = slotMatrix(games, size, (t - tLast) / HOUR, hourOfDay(t), p, shock);
+      const f = (w * covers) / win.slots;
+      for (let i = 0; i < n; i++) for (let k = 0; k < places; k++) avg[i]![k]! += m[i]![k]! * f;
+    }
   }
   const probabilities: Forecast['probabilities'] = [];
   for (let k = 0; k < places; k++) {
